@@ -1,433 +1,342 @@
 # End-to-End Real-Time Data Engineering Pipeline
 
+Airflow → PostgreSQL → Kafka → Spark Structured Streaming → Cassandra, with a
+**genuinely multi-node, replicated** deployment whose fault tolerance is proven
+by killing nodes/brokers and observing the system survive (not just configured
+on paper).
+
+## Two deployment modes
+
+| | `docker-compose.yml` (single-node demo) | `docker-compose.multinode.yml` (replicated) |
+|---|---|---|
+| Cassandra | 1 node, `SimpleStrategy`, RF=1 | **3 nodes, `NetworkTopologyStrategy`, RF=3**, racks 1/2/3 |
+| Cassandra consistency | QUORUM client (1 replica at RF=1) | **QUORUM** reads + writes (2 of 3 replicas) |
+| Kafka | 1 broker, topic RF=1 | **3 brokers, topic RF=3**, `min.insync.replicas=2` |
+| Kafka producer acks | `all` (leader only at 1 broker) | **`all`** (waits for 2 in-sync replicas) |
+| PostgreSQL | 1 instance | **primary + 1 hot-standby read replica** (streaming) |
+| Purpose | fast local demo, low RAM | distributed replication + fault-tolerance proofs |
+
+The **same application code** drives both — topology is selected by environment
+variables (no code fork). See [Configuration](#configuration-env-driven).
+
+---
+
 ## Architecture
 
 ```
 randomuser.me API ─┐
-                   ├─→ Airflow DAG (ingest_to_postgres)
-Synthetic Generator┘        │
+                   ├─→ Airflow DAG: ingest_to_postgres
+Synthetic Generator┘        │  (5,000 synthetic + ~10 live API records, in-memory)
      (in-memory, no HTTP)   ↓
-                       PostgreSQL (users_raw + dim_gender)
+                       PostgreSQL (users_raw fact + dim_gender dimension)
+                       multi-node: primary ──stream WAL──▶ read replica
                             │
-                   Airflow DAG (stream_from_postgres_to_kafka)
-                       4 threads · 64KB batches · gzip · 20ms linger
+                   Airflow DAG: stream_from_postgres_to_kafka
+                       4 threads · 64KB batches · gzip · 20ms linger · acks=all
                             │
                             ↓
-                   Kafka topic: users_created
-                   6 partitions · replication factor 1
-                   Explicit topic creation via kafka-init service
+                   Kafka topic: users_created   (key = username)
+                   single-node: 6 partitions · RF=1
+                   multi-node : 6 partitions · RF=3 · minISR=2
                             │
-                   Spark Structured Streaming
-                   Cluster mode: spark-submit → spark-master:7077
+                   Spark Structured Streaming  (spark-submit → spark-master:7077)
                    maxOffsetsPerTrigger=10000 · trigger=500ms
-                   foreachBatch: writes + latency measurement
+                   foreachBatch: enrich + latency + write to Cassandra at QUORUM
                             │
                             ↓
                    Cassandra: spark_streams.created_users
-                   UUID primary key — INSERT = upsert (idempotent)
-                   Checkpoint: /opt/spark/checkpoint (Docker volume)
+                   single-node: SimpleStrategy RF=1
+                   multi-node : NetworkTopologyStrategy RF=3, QUORUM
+                   UUID primary key — INSERT = upsert (idempotent on replay)
 
-Airflow DAG (benchmark_oltp_vs_olap) — runs after stream task
-  → PostgreSQL only: baseline flat table vs optimized fact-dimension schema
-  → Measures COUNT, filtered COUNT, GROUP BY latency on both schemas
-  → Logs speedup ratio (optimized schema is ~2× faster on filtered aggregates)
+Airflow DAG: benchmark_oltp_vs_olap  (PostgreSQL-only, after stream task)
+  → baseline flat table vs optimized fact-dimension schema (see Schema Optimization)
 ```
 
 ## Service Topology
 
+**Shared services** (both modes): Airflow webserver + scheduler, Spark master +
+worker + submit.
+
 | Service | Image | Port | Role |
 |---|---|---|---|
 | zookeeper | confluentinc/cp-zookeeper:7.4.0 | 2181 | Kafka coordination |
-| broker | confluentinc/cp-server:7.4.0 | 9092 (host) / 29092 (internal) | Kafka broker |
-| kafka-init | confluentinc/cp-server:7.4.0 | — | Creates `users_created` topic (6 partitions) on startup |
-| schema-registry | confluentinc/cp-schema-registry:7.4.0 | 8081 | Deployed, not used — JSON+StructType approach instead |
-| control-center | confluentinc/cp-enterprise-control-center:7.4.0 | 9021 | Kafka monitoring UI |
-| postgres | postgres:14.0 | 5432 | Airflow metadata DB + OLTP benchmark schema |
-| webserver | apache/airflow:2.6.0-python3.9 | 8080 | Airflow web UI |
-| scheduler | apache/airflow:2.6.0-python3.9 | — | Airflow task scheduler |
-| spark-master | bitnami/spark:latest | 9090 (UI) / 7077 | Spark cluster master |
-| spark-worker | bitnami/spark:latest | — | 2 cores, 1GB memory |
-| spark-submit | bitnami/spark:latest | — | Submits and drives spark_stream.py |
-| cassandra_db | cassandra:latest | 9042 | Stream sink (hostname: `cassandra`) |
+| broker(s) | confluentinc/cp-kafka:7.4.0 (multi) / cp-server (single) | 9092–9094 | Kafka broker(s) |
+| schema-registry | confluentinc/cp-schema-registry:7.4.0 | 8081 | Deployed, **unused** (JSON+StructType instead) |
+| postgres | bitnamilegacy/postgresql:14 (multi) / postgres:14.0 (single) | 5432/5544 | OLTP staging + Airflow metadata |
+| postgres-replica | bitnamilegacy/postgresql:14 | 5545 | **Hot-standby read replica** (multi-node only) |
+| webserver / scheduler | apache/airflow:2.6.0-python3.9 | 8080 | Airflow UI + scheduler |
+| spark-master / worker / submit | bitnami/spark:latest | 9090 / 7077 | Spark cluster + driver |
+| cassandra(-1/2/3) | cassandra:4.1 | 9042–9044 | Stream sink (3 nodes in multi-node) |
 
-Docker network: `confluent` (internal DNS resolves all service hostnames).  
-Named volume: `spark_checkpoint` mounted at `/opt/spark/checkpoint` in both spark-master and spark-submit.
+> **Note (Bitnami images):** Docker Hub restructured the Bitnami catalog in 2025;
+> `bitnami/postgresql:14` no longer resolves, so the multi-node Postgres uses
+> `bitnamilegacy/postgresql:14`. `bitnami/spark:latest` may need the same change.
 
-## Data Flow (Step by Step)
+---
 
-1. **ingest_to_postgres**: Fetches up to 10 real records from randomuser.me (falls back to synthetic on failure). Generates 5,000 synthetic records in memory using local name/city/country pools — no external dependency. Bulk-inserts all records into `users_raw` (fact table) with FK to `dim_gender` (dimension table). Uses `execute_batch(page_size=500)` for efficiency.
+## Multi-Node Replication
 
-2. **stream_from_postgres_to_kafka**: Reads unsent records from `users_raw` (`kafka_sent = FALSE`) using `SELECT FOR UPDATE SKIP LOCKED` for concurrency safety. Splits records across 4 threads. Each thread sends via `KafkaProducer(bootstrap_servers=['broker:29092'], batch_size=65536, linger_ms=20, compression_type='gzip', acks=1)`. Each record includes `event_ts_ms` (epoch milliseconds) for downstream latency measurement. Marks records `kafka_sent = TRUE` atomically in Postgres. Logs full metrics at completion.
+This is the core of the project. Each store is genuinely replicated, and each
+claim was **verified live** (see [Fault-Tolerance Verification](#fault-tolerance-verification)).
 
-3. **Spark Structured Streaming**: `spark-submit` service starts automatically with `docker-compose up`. Reads from `users_created` topic (all 6 partitions, up to 10,000 offsets per trigger). Parses JSON against a 13-field StructType schema. Uses `foreachBatch` to: compute `latency_ms = batch_start_epoch_ms - event_ts_ms`, write enriched rows to Cassandra, log p50/p95/max latency and throughput per micro-batch.
+### Cassandra — NetworkTopologyStrategy, RF=3, QUORUM
 
-4. **benchmark_oltp_vs_olap**: Runs entirely inside PostgreSQL. Compares `users_baseline` (flat TEXT gender, no indexes) vs `users_raw` (integer FK to `dim_gender`, indexed) on COUNT, filtered COUNT, and GROUP BY queries. Logs latency and speedup ratio.
+- **3 nodes**, `GossipingPropertyFileSnitch`, single DC `datacenter1`, racks
+  `rack1 / rack2 / rack3` (so RF=3 spreads one replica per rack).
+- Nodes **bootstrap one at a time** (health-gated `depends_on` chain) — Cassandra
+  requires sequential joins.
+- Keyspace replication (built from env in [spark_stream.py](spark_stream.py)):
+  ```cql
+  CREATE KEYSPACE spark_streams
+    WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': '3'};
+  ```
+- **Consistency level is explicit, not the driver default.** The DDL session sets
+  `ConsistencyLevel.QUORUM`; the Spark Cassandra connector sets
+  `spark.cassandra.output.consistency.level=QUORUM` and `input.consistency.level=QUORUM`.
+  At RF=3, QUORUM = 2 replicas → **survives one node down** for both reads and writes.
 
-## Function Call Chain
+### Kafka — 3 brokers, RF=3, min.insync.replicas=2, acks=all
 
-```
-ingest_to_postgres()
-  → ensure_pg_table()           — creates dim_gender + users_raw if not exist
-  → get_api_batch()             — randomuser.me (falls back to synthetic)
-  → generate_user_batch(5000)   — local synthetic, no HTTP
-  → store_to_postgres(users)    — execute_batch insert, FK resolved via dim_gender
+- **3 brokers** registered in ZooKeeper, topic `users_created`: **6 partitions,
+  replication factor 3**, `min.insync.replicas=2`.
+- Producer uses **`acks=all`** ([dags/kafka_stream.py](dags/kafka_stream.py)) — a
+  write is only acknowledged once ≥2 in-sync replicas have it. This is what makes
+  RF meaningful: with the old `acks=1`, a leader-only ack could be lost on failover.
+- **Partition key = `username`** (`producer.send('users_created', key=username, …)`)
+  → consistent-hash routing, per-user ordering, even spread across partitions.
 
-stream_to_kafka()
-  → read_from_postgres(5000)    — SELECT FOR UPDATE SKIP LOCKED, marks kafka_sent=TRUE
-  → KafkaProducer(broker:29092) — connection retry: 1s→2s→4s→8s→16s
-  → _send_chunk() × 4 threads  — per-message retry: 3 attempts, 10ms→20ms→40ms backoff
+### PostgreSQL — primary + hot-standby read replica (streaming replication)
 
-spark_stream.py (running in spark-submit container)
-  → create_spark_connection()   — SparkSession, master=spark://spark-master:7077
-  → connect_to_kafka()          — readStream, broker:29092, maxOffsetsPerTrigger=10000
-  → create_selection_df()       — from_json → StructType, filter id IS NOT NULL
-  → foreachBatch → process_batch()
-      → stamp latency_ms, spark_processed_at
-      → write to cassandra (spark_streams.created_users)
-      → log batch metrics
+- `postgres` (primary) streams WAL to `postgres-replica` (read-only hot standby).
+- Replica is in continuous recovery (`pg_is_in_recovery() = t`) and **rejects writes**.
+- Primary keeps hostname `postgres` so Airflow's connection string is unchanged.
+- Host ports remapped to **5544 (primary) / 5545 (replica)** to avoid clashing with
+  a local Postgres on 5432.
 
-benchmark_oltp_vs_olap()
-  → create users_baseline (flat, no index)
-  → populate from users_raw
-  → run COUNT / filter / GROUP BY on both schemas
-  → log speedup ratios
-```
+### Configuration (env-driven)
+
+The same code runs both topologies; the multi-node compose sets these:
+
+| Env var | Single-node default | Multi-node value |
+|---|---|---|
+| `CASSANDRA_HOSTS` | `cassandra` | `cassandra-1,cassandra-2,cassandra-3` |
+| `CASSANDRA_REPLICATION_STRATEGY` | `SimpleStrategy` | `NetworkTopologyStrategy` |
+| `CASSANDRA_REPLICATION_FACTOR` | `1` | `3` |
+| `CASSANDRA_DC` | `datacenter1` | `datacenter1` |
+| `KAFKA_BOOTSTRAP` | `broker:29092` | `broker-1:29092,broker-2:29092,broker-3:29092` |
+| `KAFKA_ACKS` | `all` | `all` |
+
+---
+
+## Fault-Tolerance Verification
+
+Replication is only real if it survives a failure. Three scripts in [verify/](verify/)
+inject a real failure and assert recovery. **All three passed on a live run
+(2026-06-28)** — see [verify/MULTINODE_RUNBOOK.md](verify/MULTINODE_RUNBOOK.md).
+
+| Store | Script | What it does | Result |
+|---|---|---|---|
+| Cassandra | [verify/cassandra_failure_test.sh](verify/cassandra_failure_test.sh) | Write a row at QUORUM → **stop cassandra-3** (goes `DN`) → re-read at QUORUM with node down → restart, confirm rejoin | **PASS** — row stayed readable on the 2 surviving replicas |
+| Kafka | [verify/kafka_failure_test.sh](verify/kafka_failure_test.sh) | Produce 1,000 at acks=all → **stop broker-2** (ISR shrinks 3→2, leaders fail over) → produce 500 more + consume all | **PASS** — **1,500/1,500 messages, 0 lost** |
+| PostgreSQL | [verify/postgres_replication_test.sh](verify/postgres_replication_test.sh) | Write on primary → read it on replica → attempt a write on replica | **PASS** — row streamed across; replica rejected the write (read-only) |
+
+> The run was executed **one cluster at a time** because Docker was allocated 7.7 GB;
+> the full 15-service stack needs ~12 GB. The proofs are independent and each fits.
+
+---
+
+## Measured Performance
+
+These are **measured from live runs**, not estimates, unless explicitly noted.
+
+### Kafka producer throughput — measured ~15,800 msg/sec
+
+| Metric | Value | Conditions |
+|---|---|---|
+| Records sent | 5,000 / 5,000 (100%) | 3-broker Kafka, RF=3, `acks=all`, gzip, 64KB batches, 4 threads |
+| Elapsed | 0.32 s | from `ThreadPoolExecutor` entry to after `producer.flush()` |
+| **Throughput** | **~15,801 msg/sec** | producer-side enqueue + flush |
+
+> Caveat to state honestly: `producer.send()` is non-blocking (enqueues into the
+> producer buffer); `flush()` confirms broker delivery. So this is **producer-side
+> throughput to a replicated cluster**, not end-to-end through Spark.
+
+### Retry resilience under fault injection (simulated)
+
+A configurable failure injector (`KAFKA_INJECT_FAILURE_RATE`) raises a simulated
+transient error before each send to exercise the 3-attempt, 10→20→40ms backoff.
+Recovery/retry counts are computed from real in-process counters; the failures are
+**simulated, not a live broker fault**. At 35% injection (formula-consistent):
+
+| Metric | Value |
+|---|---|
+| Overall success rate (`1 − p³`) | **95.7%** |
+| Recovery rate among retried records (`1 − p²`) | **87.8%** |
+| Avg retries per retried record (`1 + p + p²`) | **1.47** |
+
+### Schema optimization (OLAP fact-dimension) — design goal vs measured
+
+**Design goal:** replace a flat table with `gender` as `TEXT` (sequential scans)
+by a fact table with an `INTEGER` FK to `dim_gender` plus an index on `gender_id`,
+targeting **~2× faster** analytical queries (filtered COUNT, GROUP BY) at scale —
+index scans + integer comparisons instead of full-table text scans.
+
+**Measured at demo scale (10,020 rows):** the optimized schema was **0.7–0.8×**
+(i.e. slightly *slower*) — at this size everything fits in memory and the extra
+join to `dim_gender` costs more than the index saves:
+
+| Query | Baseline (flat) | Optimized (fact-dim) | Speedup |
+|---|---|---|---|
+| COUNT(*) | 0.3 ms | 0.4 ms | 0.8× |
+| Filtered COUNT | 0.4 ms | 0.6 ms | 0.7× |
+| GROUP BY gender | 1.1 ms | 1.5 ms | 0.7× |
+
+**Honest status:** the **~2× benefit is expected to materialize only at large scale**
+(millions of rows, where an index scan avoids reading the whole table). That regime
+is **not yet measured** here. The benchmark harness ([dags/kafka_stream.py](dags/kafka_stream.py)
+`benchmark_oltp_vs_olap`) is real and computes the ratio from measured timings —
+re-run it after loading millions of rows to validate the 2× target.
+
+### Not yet measured
+
+- **Spark end-to-end latency (p50/p95/max)** and **Cassandra write duration per
+  batch** — require Spark + Cassandra + Kafka up together (~12 GB), which did not
+  fit in the 7.7 GB Docker allocation used for verification. Theoretical p95 ceiling:
+  `linger 20ms + trigger 500ms ≈ 520ms`.
+
+---
 
 ## Kafka Topic Configuration
 
-| Parameter | Value |
-|---|---|
-| Topic name | `users_created` |
-| Partitions | 6 |
-| Replication factor | 1 |
-| Creation method | `kafka-init` service on startup (explicit, not auto-create) |
-| Internal broker address | `broker:29092` |
-| External host address | `localhost:9092` |
-| Message key | `username` (consistent partition routing per user) |
-| Compression | gzip |
-| Auto-topic-creation | Not relied upon |
-
-## Spark Execution Mode
-
-Spark runs in **cluster mode** via the `spark-submit` Docker service:
-
-```
-spark-submit
-  --master spark://spark-master:7077
-  --packages com.datastax.spark:spark-cassandra-connector_2.13:3.4.1,
-             org.apache.spark:spark-sql-kafka-0-10_2.13:3.4.1
-  --conf spark.cassandra.connection.host=cassandra
-  --conf spark.sql.shuffle.partitions=6
-  /opt/bitnami/spark/jobs/spark_stream.py
-```
-
-The driver runs inside the `spark-submit` container (client deploy mode). The worker provides 2 cores and 1GB RAM. `shuffle.partitions=6` matches the Kafka partition count so each partition maps to one Spark task per micro-batch.
-
-## Delivery Guarantee
-
-**Two distinct legs with different semantics.**
-
-| Leg | Guarantee | Mechanism |
+| Parameter | Single-node | Multi-node |
 |---|---|---|
-| Postgres → Kafka | **At-most-once** | `kafka_sent=TRUE` is set when rows are READ, before Kafka delivery is confirmed. If the task crashes between read and flush, those rows are permanently marked sent but never delivered to Kafka. No retry will pick them up. |
-| Kafka → Cassandra | **At-least-once** | Spark checkpoints Kafka offsets after each successful micro-batch. On restart, Spark replays from the last committed offset. Cassandra UUID upsert makes replay safe. |
-
-**Why at-most-once on the Postgres→Kafka leg:** marking rows before send prevents duplicate delivery on retry, but risks silent message loss on task failure. The correct fix is to mark `kafka_sent=TRUE` only after `producer.flush()` succeeds — but then a crash between flush and UPDATE causes a duplicate send. A full solution requires a CDC tool (Debezium) or Kafka transactions, neither of which is implemented here.
-
-**Exactly-once end-to-end is not implemented.** Achieving it would require Kafka transactions + Cassandra conditional writes (LWT), which adds significant complexity and latency not warranted at this scale.
-
-## Checkpoint and Replay Behavior
-
-| Scenario | Behavior |
-|---|---|
-| Spark restarts with checkpoint intact | Resumes from last committed offset. No duplicate writes (UUID upsert). |
-| Checkpoint deleted | Starts from `startingOffsets=earliest` — replays all Kafka-retained messages. Cassandra upserts remain safe. |
-| `kafka.group.id` | Not explicitly set. Spark uses its own internal offset tracking via checkpoint, not Kafka consumer group commits. |
-
-## Backpressure
-
-`maxOffsetsPerTrigger=10000` caps how many Kafka offsets Spark reads per 500ms trigger. This prevents a slow Cassandra write from causing unbounded queue buildup. At 10,000 records per 500ms trigger, the theoretical max throughput cap is 20,000 rows/sec — well above producer capacity in this demo.
-
-## Quick Start
-
-```bash
-# Start the full stack (Kafka, Airflow, Spark cluster + submit, Cassandra)
-docker-compose up -d
-
-# Wait ~60 seconds for all services to become healthy, then trigger the DAG
-# via Airflow UI at http://localhost:8080 (admin / admin)
-# or via CLI:
-docker exec -it $(docker ps -qf name=scheduler) airflow dags trigger user_automation
-```
-
-The `spark-submit` service starts automatically and begins consuming from Kafka.
-
-## Resilience Benchmark
-
-To run the 35% failure injection benchmark, set `KAFKA_INJECT_FAILURE_RATE=0.35` in `docker-compose.yml` for both `webserver` and `scheduler`, then restart and trigger the DAG:
-
-```bash
-# Edit docker-compose.yml: set KAFKA_INJECT_FAILURE_RATE=0.35 in webserver + scheduler
-docker-compose up -d webserver scheduler
-docker exec -it $(docker ps -qf name=scheduler) airflow dags trigger user_automation
-```
-
-**Measured log output from mock-producer benchmark** (no network IO — elapsed dominated by retry sleep time):
-
-```
-── Kafka Producer Metrics [RESILIENCE BENCHMARK (inject=35%)] ─────────────
-  Records read from PostgreSQL      : 5010
-  Validation-rejected (no id/user)  : 0
-  Successfully sent to Kafka        : 4775
-  Permanently failed                : 235
-  Records that needed ≥1 retry      : 1806
-  Total retry attempts              : 2672
-  Avg retries (for retried records) : 1.48
-  Recovery rate (retried records)   : 87.0%
-  Overall success rate              : 95.3%
-  Elapsed time                      : 12.31s  ← retry sleep time, not network
-  Mock-producer throughput          : 388 msg/sec  ← NOT representative of real Kafka
-────────────────────────────────────────────────────────────────────────────
-```
-
-> **IMPORTANT:** At 35% injection, elapsed time is dominated by retry sleep delays  
-> (theoretical: ~9.6s of retry sleeps per thread for 1,252 records). This is correct  
-> behavior — each failed attempt sleeps 10ms → 20ms → 40ms before retrying.  
-> Real Kafka throughput (with broker, network, gzip) has NOT been measured from  
-> a live Docker run. See Evidence Gaps below.
-
-**Theoretical validation (INJECT_FAILURE_RATE=0.35):**
-
-| Metric | Theoretical | Measured (5 runs avg) |
-|---|---|---|
-| P(permanent failure) | 0.35³ = 4.29% | 4.43–4.77% |
-| Overall success rate | 95.71% | 95.2–96.1% |
-| Recovery rate (retried records) | (1 − 0.35²) × 100 = 87.75% | 86.6–88.4% |
-| Avg retries per retried record | 1.47 | 1.47–1.50 |
-
-**How throughput is calculated:** `counters['sent'] / elapsed_wall_clock_seconds`. Elapsed runs from before `ThreadPoolExecutor` entry to after `producer.flush()`. In resilience-benchmark mode, elapsed is dominated by retry sleep delays, not network IO.
-
-**How recovery is calculated:** `(retried_records - permanently_failed) / retried_records × 100`. A record is permanently failed only if all 3 retry attempts fail.
-
-## Latency Measurement
-
-End-to-end latency is measured in `process_batch()` in `spark_stream.py`:
-
-```
-latency_ms = batch_start_epoch_ms  (when Spark starts the micro-batch)
-           - event_ts_ms           (when producer stamped the record before send)
-```
-
-This captures: Kafka buffering time + Spark trigger interval + any scheduling delay. It does NOT include Cassandra write time (that is part of batch duration).
-
-**Spark log format** (actual values require running the Docker stack):
-
-```
-── Spark Micro-Batch [N] ──────────────────────────────
-  Rows in batch           : <count>
-  Batch write duration    : <elapsed_ms> ms
-  Write throughput        : <rows/sec> rows/sec
-  Latency p50/p95/max     : <p50> ms / <p95> ms / <p_max> ms  [N/N rows measured]
-────────────────────────────────────────────────────────────────────────────
-```
-
-**NOT MEASURED from a live run.** Latency values (p50/p95/max) require the full Docker stack running. Theoretical ceiling: `linger_ms=20 + trigger=500ms ≈ 520ms` for p95 under ideal conditions. Actual values depend on host machine load, JVM GC pauses, and Cassandra write speed.
-
-## PostgreSQL Role
-
-| Usage | Tables | Purpose |
-|---|---|---|
-| Airflow metadata | Airflow internal tables | Task state, DAG runs, logs |
-| OLTP ingestion layer | `users_raw`, `dim_gender` | Staging buffer between API fetch and Kafka |
-| Benchmark only | `users_baseline` | Flat schema for before/after query comparison |
-
-**PostgreSQL is NOT the main pipeline sink.** It is a staging buffer. The main pipeline sink is Cassandra. The `benchmark_oltp_vs_olap` task is a standalone demo that measures PostgreSQL schema optimization — it does not query Cassandra.
+| Topic | `users_created` | `users_created` |
+| Partitions | 6 | 6 |
+| Replication factor | 1 | **3** |
+| `min.insync.replicas` | 1 | **2** |
+| Producer `acks` | `all` | `all` |
+| Message key | `username` (consistent per-user routing) | same |
+| Compression | gzip | gzip |
+| Creation | explicit (`kafka-topics --create`), not auto-create | same |
 
 ## Cassandra Schema
 
 ```cql
+-- multi-node replication
 CREATE KEYSPACE spark_streams
-  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};
+  WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': '3'};
 
 CREATE TABLE spark_streams.created_users (
     id                 UUID PRIMARY KEY,
-    first_name         TEXT,
-    last_name          TEXT,
-    gender             TEXT,
-    address            TEXT,
-    post_code          TEXT,
-    email              TEXT,
-    username           TEXT,
-    dob                TEXT,
-    registered_date    TEXT,
-    phone              TEXT,
-    picture            TEXT,
+    first_name TEXT, last_name TEXT, gender TEXT, address TEXT, post_code TEXT,
+    email TEXT, username TEXT, dob TEXT, registered_date TEXT, phone TEXT, picture TEXT,
     event_ts_ms        BIGINT,   -- producer-side epoch ms (latency source)
-    spark_processed_at TEXT,     -- ISO UTC timestamp when Spark processed the batch
-    latency_ms         DOUBLE    -- measured end-to-end latency in milliseconds
+    spark_processed_at TEXT,     -- ISO UTC when Spark processed the batch
+    latency_ms         DOUBLE    -- measured end-to-end latency (ms)
 );
 ```
 
-Service name in Docker Compose: `cassandra_db`. Hostname (used by all connectors): `cassandra`. Container name: `cassandra`.
+Writes go through the Spark Cassandra connector at **QUORUM**. `id` is the partition
+key, so re-inserts are idempotent upserts — safe on Spark micro-batch replay.
 
-## Schema Registry
+## Delivery Guarantee
 
-Schema Registry (`schema-registry:8081`) is deployed and running. It is **not used** in the current pipeline. Messages are serialized as plain JSON. Spark uses a hardcoded `StructType` for schema enforcement. Schema Registry + Avro is a future improvement for schema evolution and consumer compatibility guarantees.
+| Leg | Guarantee | Mechanism |
+|---|---|---|
+| Postgres → Kafka | **At-most-once** | rows marked `kafka_sent=TRUE` at read time, before delivery is confirmed. Prevents duplicates; risks loss on task crash. A full outbox/CDC (Debezium) would give at-least-once. |
+| Kafka → Cassandra | **At-least-once** | Spark checkpoints offsets per micro-batch; replay on restart; Cassandra UUID upsert makes replay safe. |
+
+Exactly-once end-to-end is **not** implemented (would need Kafka transactions +
+Cassandra LWT).
+
+---
+
+## Bugs Found & Fixed During Verification
+
+Running the pipeline for real (not just reading config) surfaced four genuine bugs.
+Each is fixed; together they indicate the pipeline had not previously been run
+end-to-end.
+
+1. **Cassandra retry never reached its advertised backoff.** [spark_stream.py](spark_stream.py)
+   claimed `1s → 2s → 4s` but the loop raised after 3 attempts, so it only ever slept
+   `1s, 2s`. Fixed to 4 attempts → genuine `1s → 2s → 4s`.
+2. **Airflow could not start.** [requirements.txt](requirements.txt) pinned
+   `Flask-AppBuilder==4.3.3`, conflicting with `apache-airflow==2.6.0` (needs `4.3.0`).
+   Fixed to `4.3.0`.
+3. **`stream_to_kafka()` had never worked.** [dags/kafka_stream.py](dags/kafka_stream.py)
+   used `FOR UPDATE SKIP LOCKED` on a query with a `LEFT JOIN dim_gender`; Postgres
+   rejects this ("FOR UPDATE cannot be applied to the nullable side of an outer join").
+   Fixed to `FOR UPDATE OF u SKIP LOCKED` (lock only the fact-table rows).
+4. **Mislabeled retry metrics.** Comments called the 95.7% *success* rate "recovery"
+   and quoted 1.35 retries; corrected to success 95.7% / recovery 87.8% / 1.47 retries.
+
+---
+
+## Quick Start
+
+### Single-node demo (low RAM)
+```bash
+docker-compose up -d
+# Airflow UI http://localhost:8080 (admin/admin) → trigger DAG 'user_automation'
+```
+
+### Multi-node replicated stack
+```bash
+# Raise Docker Desktop → Settings → Resources → Memory to >=12 GB first.
+docker compose -f docker-compose.multinode.yml up -d
+watch -n5 'docker exec cassandra-1 nodetool status'   # wait for 3x UN
+
+# Prove fault tolerance:
+./verify/cassandra_failure_test.sh
+./verify/kafka_failure_test.sh
+./verify/postgres_replication_test.sh
+```
+
+See [verify/MULTINODE_RUNBOOK.md](verify/MULTINODE_RUNBOOK.md) for the full sequence,
+recorded results, and a template for measuring the remaining (Spark-latency) numbers.
+
+## Known Limitations
+
+- **Single-node demo has no redundancy** (RF=1) — use the multi-node compose for
+  fault tolerance.
+- **Spark driver in `client` mode** inside the submit container — no auto-restart if
+  it crashes. Production would use `--deploy-mode cluster` + supervisor/k8s.
+- **At-most-once Postgres→Kafka** (see Delivery Guarantee).
+- **Schema Registry deployed but unused** — JSON + Spark `StructType` instead.
+- **No dead-letter queue** — malformed records with null `id` are dropped in Spark.
+- **2× OLAP speedup unproven at scale** — measured 0.7–0.8× at 10k rows (see above).
+- **Spark end-to-end latency unmeasured** — needs the full stack (~12 GB).
 
 ## Observability
 
 ```bash
-# Kafka topic partition offsets and consumer lag
-docker exec -it broker kafka-consumer-groups \
-  --bootstrap-server localhost:9092 --all-groups --describe
-
-# Real-time Kafka messages
-docker exec -it broker kafka-console-consumer \
-  --topic users_created --from-beginning \
-  --bootstrap-server localhost:9092
-
-# Cassandra record count
-docker exec -it cassandra cqlsh -e \
-  "SELECT COUNT(*) FROM spark_streams.created_users;"
-
-# Spark streaming logs (latency + throughput per micro-batch)
-docker logs -f $(docker ps -qf name=spark-submit)
-
-# Airflow producer metrics (throughput + retry stats)
-docker logs -f $(docker ps -qf name=scheduler)
-
-# Confluent Control Center (topic health, partition lag)
-open http://localhost:9021
-
-# Spark Master UI (worker status, running jobs)
-open http://localhost:9090
+docker exec -it cassandra-1 nodetool status                      # Cassandra ring
+docker exec -it broker-1 kafka-topics --bootstrap-server broker-1:29092 \
+  --describe --topic users_created                               # RF / ISR
+docker exec -it cassandra-1 cqlsh -e \
+  "SELECT COUNT(*) FROM spark_streams.created_users;"            # sink count
+docker logs -f spark-submit                                      # Spark batch metrics
+docker logs -f $(docker ps -qf name=scheduler)                   # producer metrics
 ```
-
-## Evidence Gaps (Metrics Requiring Docker Stack)
-
-The following metrics have NOT been measured from a live run. They require `docker-compose up` with a working network environment.
-
-| Metric | Status | What to run to measure it |
-|---|---|---|
-| Real Kafka throughput (msg/sec) | NOT MEASURED | Airflow scheduler log after triggering DAG: `docker logs -f $(docker ps -qf name=scheduler)` |
-| Latency p50 / p95 / max | NOT MEASURED | Spark submit log: `docker logs -f $(docker ps -qf name=spark-submit)` |
-| Cassandra write duration per batch | NOT MEASURED | Same Spark submit log (`Batch write duration` line) |
-| PostgreSQL benchmark speedup (actual ratio) | NOT MEASURED | Airflow scheduler log for `benchmark_oltp_vs_olap` task |
-| Threading throughput comparison (1 vs 2 vs 4 threads, real broker) | NOT MEASURED | Modify `NUM_THREADS` and re-run DAG |
-| Gzip vs no-gzip throughput comparison | NOT MEASURED | Change `compression_type` and re-run DAG |
-
-**What HAS been measured (no Docker required):**
-
-| Metric | Measured value | Source |
-|---|---|---|
-| Retry benchmark: overall success rate at 35% injection | 95.2–96.1% (5 runs) | `pytest`-equivalent mock benchmark |
-| Retry benchmark: recovery rate among retried records | 86.6–88.4% (5 runs) | Same |
-| Retry benchmark: avg retries per retried record | 1.47–1.50 (5 runs) | Same |
-| Theoretical alignment: P(perm_fail) = 0.35³ = 4.29% | Actual: 4.43–4.77% | Same |
-| JSON serialization: 5,010 records | 10.13 ms total, 2.02 µs/record | Direct measurement |
-| Gzip compression ratio on JSON records | 1.40× (28.7% savings per message) | Direct measurement |
-| Single record size: raw JSON vs gzip | 469 bytes → 335 bytes | Direct measurement |
-| Retry elapsed time at 35% injection (mock) | 11.73–12.92s (retry-sleep dominated) | Direct measurement |
-
-## Scaling Path
-
-| Dimension | Current | Horizontal scale |
-|---|---|---|
-| Kafka | 1 broker, 6 partitions, RF=1 | Add brokers → increase RF and partition count → linear throughput |
-| Spark | 1 worker (2 cores, 1GB) | Add `spark-worker` replicas → each partition → 1 parallel task |
-| Cassandra | 1 node, RF=1 | Add nodes → consistent hash distributes writes automatically |
-| Producer | 4 threads | Increase `NUM_THREADS` or use CeleryExecutor for multi-node Airflow |
-
-## Known Limitations (Non-Production)
-
-- **Single Kafka broker** — no replication, no fault tolerance. RF=1 means data loss if broker dies.
-- **Single Cassandra node** — RF=1, no quorum. Not production-safe.
-- **At-most-once Postgres→Kafka** — rows are marked `kafka_sent=TRUE` at read time, before Kafka delivery. Task failure after the mark silently drops those records. See Delivery Guarantee section.
-- **No exactly-once end-to-end** — Kafka→Cassandra is at-least-once via checkpointing. Full exactly-once requires Kafka transactions + Cassandra LWT.
-- **No Schema Registry usage** — schema changes require manual StructType updates and DAG redeployment. Schema Registry is deployed but unused.
-- **No dead-letter queue** — malformed Kafka messages with null `id` are dropped by the `filter(id.isNotNull())` step in Spark. Messages with other null fields are written to Cassandra as-is. No rejected-row counter or DLQ topic is implemented.
-- **Sequential Airflow executor** — tasks run one at a time per DAG run. Use CeleryExecutor for parallel task execution across multiple DAGs.
-- **Spark driver in submit container** — deploy mode is `client` (default). The driver runs inside the `spark-submit` container. If that container crashes, the streaming job stops and does not auto-restart. A production setup would use `--deploy-mode cluster` with Spark supervisor or Kubernetes restart policy.
-- **1 worker, 2 cores vs 6 Kafka partitions** — the Kafka topic has 6 partitions but the single Spark worker only has 2 cores. Spark reads all 6 partitions per trigger, but executes at most 2 tasks concurrently. This means reading 6 partitions takes 3 scheduling waves. Adding workers eliminates this bottleneck.
-- **Checkpoint in Docker volume** — durable across container restarts but lost if the named volume is deleted. Use cloud object storage (S3/GCS) for production checkpoints.
-- **PostgreSQL `kafka_sent` flag** — outbox pattern approximation without a CDC tool. Suitable for demo; at scale, use Debezium for reliable change capture.
-- **No automated integration tests** — unit tests cover the synthetic generator, UUID behavior, serialization, and latency fields (see `tests/test_pipeline.py`). There are no integration tests against Kafka, Postgres, Spark, or Cassandra. Running integration tests requires the full Docker Compose stack.
-- **No consumer/query layer** — Cassandra is the final sink. There is no API, dashboard, or query service reading from it. Validation is done via `cqlsh` directly.
-
-## Data Retention
-
-| Layer | Default retention | Cleanup mechanism |
-|---|---|---|
-| Kafka `users_created` topic | 7 days (broker default `log.retention.hours=168`) | Automatic segment deletion by broker. Not configured explicitly in docker-compose. |
-| PostgreSQL `users_raw` | Indefinite — rows accumulate; `kafka_sent` flag is never reset | Manual: `DELETE FROM users_raw WHERE kafka_sent = TRUE;` |
-| PostgreSQL `users_baseline` | Indefinite — benchmark table populated once per DAG run via `ON CONFLICT DO NOTHING` | Manual: `TRUNCATE users_baseline;` |
-| Cassandra `spark_streams.created_users` | Indefinite — no TTL set on the table | Manual: `TRUNCATE spark_streams.created_users;` or add `WITH default_time_to_live` on table |
-| Spark checkpoint (`/opt/spark/checkpoint`) | Persists for the lifetime of the `spark_checkpoint` Docker named volume | Manual: `docker volume rm scalable-real-time-data-pipeline_spark_checkpoint` |
-
-## Tests
-
-Unit tests cover the synthetic generator and serialization layer. No Docker or external services required.
-
-```bash
-# From project root
-pip install pytest   # already pulled in by apache-airflow in requirements.txt
-pytest tests/test_pipeline.py -v
-```
-
-Tests:
-
-| Test | What it validates |
-|---|---|
-| `test_generate_user_batch_count` | `generate_user_batch(n)` returns exactly n records |
-| `test_generate_user_batch_schema` | All 13 required fields present in every record |
-| `test_uuid_validity` | `id` is a valid UUID4 string |
-| `test_uuid_uniqueness` | No duplicate ids within a batch of 500 |
-| `test_gender_values` | Gender is always `male` or `female` |
-| `test_event_ts_ms_is_recent_int` | `event_ts_ms` is a positive int within 2s of now |
-| `test_kafka_payload_round_trip` | `json.dumps(record).encode()` round-trips losslessly |
-| `test_latency_field_is_non_negative` | Simulated `batch_start_ms - event_ts_ms` is ≥ 0 |
-
-Integration tests (Kafka, Postgres, Spark, Cassandra) are not implemented. Refer to the Observability section for manual validation commands.
-
-## Resource Usage Evidence
-
-Resource metrics below are expected ranges based on the configured resources. Actual numbers vary by host machine.
-
-| Metric | Expected range | How to observe |
-|---|---|---|
-| Spark micro-batch duration | 200–600 ms per batch | `docker logs -f $(docker ps -qf name=spark-submit)` |
-| Spark write throughput | 5,000–20,000 rows/sec | Same log — `Write throughput` line |
-| Kafka producer throughput | ~1,000–1,500 msg/sec | Airflow task log — `Throughput` line |
-| Kafka consumer lag | Should drain to 0 within seconds | `docker exec -it broker kafka-consumer-groups --bootstrap-server localhost:9092 --all-groups --describe` |
-| Cassandra write latency | Logged per batch as `Batch write duration` | Spark submit log |
-| Docker resource usage | Not captured | `docker stats` while pipeline is running |
-
-No Prometheus, Grafana, or custom metrics are implemented. All observability is via structured logging and the Confluent Control Center UI.
-
-## Access Points
-
-| Service | URL | Credentials |
-|---|---|---|
-| Airflow UI | http://localhost:8080 | admin / admin |
-| Kafka Control Center | http://localhost:9021 | — |
-| Spark Master UI | http://localhost:9090 | — |
-| Schema Registry | http://localhost:8081 | — |
 
 ## Project Structure
 
 ```
-├── docker-compose.yml        # 12 services + spark_checkpoint volume
-├── dags/
-│   └── kafka_stream.py       # 3-task Airflow DAG + synthetic generator + Kafka producer
-├── spark_stream.py           # Spark Structured Streaming consumer → Cassandra
-├── script/
-│   └── entrypoint.sh         # Airflow webserver init (db init, user create, pip install)
-└── requirements.txt          # Python deps for Airflow containers
+├── docker-compose.yml             # single-node demo
+├── docker-compose.multinode.yml   # 3-node Cassandra + 3-broker Kafka + PG primary/replica
+├── dags/kafka_stream.py           # Airflow DAG: ingest, stream-to-kafka, OLAP benchmark
+├── spark_stream.py                # Spark Structured Streaming consumer → Cassandra (QUORUM)
+├── verify/
+│   ├── cassandra_failure_test.sh  # RF=3 / QUORUM node-kill proof
+│   ├── kafka_failure_test.sh      # RF=3 / acks=all broker-kill proof
+│   ├── postgres_replication_test.sh
+│   └── MULTINODE_RUNBOOK.md       # run steps + recorded results + measured numbers
+├── script/entrypoint.sh           # Airflow init
+└── requirements.txt               # Airflow deps (Flask-AppBuilder pinned to 4.3.0)
 ```
 
 ## Author
 
-**Kartik Vadhawana**
-- Email: kartikvadhwana7@gmail.com
-- LinkedIn: [kartikvadhawana](https://linkedin.com/in/kartikvadhawana)
-- GitHub: [VKartik-3](https://github.com/VKartik-3)
+**Kartik Vadhawana** — [GitHub](https://github.com/Vkartik-3) ·
+[LinkedIn](https://linkedin.com/in/kartikvadhawana)
