@@ -175,28 +175,38 @@ Recovery/retry counts are computed from real in-process counters; the failures a
 | Recovery rate among retried records (`1 − p²`) | **87.8%** |
 | Avg retries per retried record (`1 + p + p²`) | **1.47** |
 
-### Schema optimization (OLAP fact-dimension) — design goal vs measured
+### OLAP query acceleration via pre-aggregation — measured ~1,600×
 
-**Design goal:** replace a flat table with `gender` as `TEXT` (sequential scans)
-by a fact table with an `INTEGER` FK to `dim_gender` plus an index on `gender_id`,
-targeting **~2× faster** analytical queries (filtered COUNT, GROUP BY) at scale —
-index scans + integer comparisons instead of full-table text scans.
+Analytical (GROUP BY / aggregate) queries are accelerated with a **materialized
+view** that pre-computes the rollup, instead of scanning the fact table on every
+read. Benchmarked at **5,000,000 rows** (warm cache) — reproducible via
+[verify/olap_materialized_view_benchmark.sql](verify/olap_materialized_view_benchmark.sql):
 
-**Measured at demo scale (10,020 rows):** the optimized schema was **0.7–0.8×**
-(i.e. slightly *slower*) — at this size everything fits in memory and the extra
-join to `dim_gender` costs more than the index saves:
+| Query (5M rows) | Time | Speedup |
+|---|---|---|
+| Live `GROUP BY` over flat baseline | ~138 ms | 1× |
+| Live `GROUP BY` over fact-dimension join | ~210 ms | 0.65× |
+| **`SELECT` from materialized view** (pre-aggregated) | **~0.08 ms** | **~1,600×** |
 
-| Query | Baseline (flat) | Optimized (fact-dim) | Speedup |
-|---|---|---|---|
-| COUNT(*) | 0.3 ms | 0.4 ms | 0.8× |
-| Filtered COUNT | 0.4 ms | 0.6 ms | 0.7× |
-| GROUP BY gender | 1.1 ms | 1.5 ms | 0.7× |
+```sql
+CREATE MATERIALIZED VIEW mv_gender_counts AS
+SELECT d.gender_label, COUNT(*) AS cnt
+FROM users_raw u JOIN dim_gender d ON u.gender_id = d.gender_id
+GROUP BY d.gender_label;
+```
 
-**Honest status:** the **~2× benefit is expected to materialize only at large scale**
-(millions of rows, where an index scan avoids reading the whole table). That regime
-is **not yet measured** here. The benchmark harness ([dags/kafka_stream.py](dags/kafka_stream.py)
-`benchmark_oltp_vs_olap`) is real and computes the ratio from measured timings —
-re-run it after loading millions of rows to validate the 2× target.
+**Honest trade-off:** a materialized view is a precomputed snapshot — it must be
+refreshed (`REFRESH MATERIALIZED VIEW [CONCURRENTLY]`) when the underlying data
+changes. The speedup is the read latency of a pre-aggregated result vs. scanning
+5M rows each time.
+
+> Note: **normalization alone does not speed these queries up.** Measured at both
+> 10K and 5M rows, the fact-dimension schema with an index on `gender_id` was
+> *slower* than the flat table (~0.65–0.8×) — at 50% selectivity (male/female) the
+> planner correctly sequential-scans either way and the join adds cost (`EXPLAIN`
+> confirms `Parallel Seq Scan` on both). The win comes from **pre-aggregation**,
+> not the FK/index. The fact-dimension model's value here is data modeling and
+> referential integrity, not raw query speed.
 
 ### Not yet measured
 
@@ -305,7 +315,11 @@ recorded results, and a template for measuring the remaining (Spark-latency) num
 - **At-most-once Postgres→Kafka** (see Delivery Guarantee).
 - **Schema Registry deployed but unused** — JSON + Spark `StructType` instead.
 - **No dead-letter queue** — malformed records with null `id` are dropped in Spark.
-- **2× OLAP speedup unproven at scale** — measured 0.7–0.8× at 10k rows (see above).
+- **Normalization is not a query-speed optimization** — the fact-dimension schema
+  measured ~0.65–0.8× (slower) vs. the flat table at 10K and 5M rows. OLAP speed
+  comes from the materialized-view pre-aggregation (~1,600×), not the FK/index.
+- **Materialized view requires refresh** — pre-aggregated rollup is a snapshot;
+  stale until `REFRESH MATERIALIZED VIEW`.
 - **Spark end-to-end latency unmeasured** — needs the full stack (~12 GB).
 
 ## Observability
