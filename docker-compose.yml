@@ -55,6 +55,19 @@ services:
       timeout: 5s
       retries: 5
 
+  kafka-init:
+    image: confluentinc/cp-server:7.4.0
+    depends_on:
+      broker:
+        condition: service_healthy
+    entrypoint: [ '/bin/bash', '-c' ]
+    command: |
+      "kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
+        --topic users_created --partitions 6 --replication-factor 1 && \
+      echo 'Topic users_created created with 6 partitions'"
+    networks:
+      - confluent
+
   schema-registry:
     image: confluentinc/cp-schema-registry:7.4.0
     hostname: schema-registry
@@ -75,7 +88,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-  
+
   control-center:
     image: confluentinc/cp-enterprise-control-center:7.4.0
     hostname: control-center
@@ -115,6 +128,8 @@ services:
       - EXECUTOR=Sequential
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       - AIRFLOW_WEBSERVER_SECRET_KEY=this_is_a_very_secured_key
+      # Set to 0.35 to run the resilience benchmark (35% injected failure rate)
+      - KAFKA_INJECT_FAILURE_RATE=0.0
     logging:
       options:
         max-size: 10m
@@ -147,12 +162,16 @@ services:
       - EXECUTOR=Sequential
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       - AIRFLOW_WEBSERVER_SECRET_KEY=this_is_a_very_secured_key
+      # Set to 0.35 to run the resilience benchmark (35% injected failure rate)
+      - KAFKA_INJECT_FAILURE_RATE=0.0
     command: bash -c "pip install -r ./requirements.txt && airflow db upgrade && airflow scheduler"
     networks:
       - confluent
 
   postgres:
     image: postgres:14.0
+    ports:
+      - "5432:5432"
     environment:
       - POSTGRES_USER=airflow
       - POSTGRES_PASSWORD=airflow
@@ -170,8 +189,11 @@ services:
     ports:
       - "9090:8080"
       - "7077:7077"
+    volumes:
+      - spark_checkpoint:/opt/spark/checkpoint
     networks:
       - confluent
+
   spark-worker:
     image: bitnami/spark:latest
     command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
@@ -182,6 +204,25 @@ services:
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 1g
       SPARK_MASTER_URL: spark://spark-master:7077
+    networks:
+      - confluent
+
+  spark-submit:
+    image: bitnami/spark:latest
+    depends_on:
+      - spark-master
+      - spark-worker
+      - cassandra_db
+    volumes:
+      - ./spark_stream.py:/opt/bitnami/spark/jobs/spark_stream.py
+      - spark_checkpoint:/opt/spark/checkpoint
+    command: >
+      spark-submit
+        --master spark://spark-master:7077
+        --packages com.datastax.spark:spark-cassandra-connector_2.13:3.4.1,org.apache.spark:spark-sql-kafka-0-10_2.13:3.4.1
+        --conf spark.cassandra.connection.host=cassandra
+        --conf spark.sql.shuffle.partitions=6
+        /opt/bitnami/spark/jobs/spark_stream.py
     networks:
       - confluent
 
@@ -198,5 +239,9 @@ services:
       - CASSANDRA_PASSWORD=cassandra
     networks:
       - confluent
+
 networks:
   confluent:
+
+volumes:
+  spark_checkpoint:
